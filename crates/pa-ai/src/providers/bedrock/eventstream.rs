@@ -227,8 +227,8 @@ mod tests {
 
     #[test]
     fn decodes_framed_messages_across_chunk_boundaries() {
-        let frame1 = frame("messageStart", br#"{"messageStart":{"role":"assistant"}}"#);
-        let mut frame2 = frame("metadata", br#"{"metadata":{"usage":{"inputTokens":5}}}"#);
+        let frame1 = frame("messageStart", br#"{"role":"assistant"}"#);
+        let mut frame2 = frame("metadata", br#"{"usage":{"inputTokens":5}}"#);
         // split the second frame across two pushes
         let split = frame2.len() / 2;
         let tail2 = frame2.split_off(split);
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(all[0].event_type.as_deref(), Some("messageStart"));
         assert_eq!(
             String::from_utf8_lossy(&all[0].payload),
-            r#"{"messageStart":{"role":"assistant"}}"#
+            r#"{"role":"assistant"}"#
         );
         assert_eq!(all[1].event_type.as_deref(), Some("metadata"));
     }

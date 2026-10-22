@@ -95,49 +95,37 @@ pub(crate) fn handle_event(
         ));
     }
 
-    if let Some(message_start) = parsed.get("messageStart") {
-        let role = message_start
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if role != "assistant" {
-            return Err(ProviderError::Message(
-                "Unexpected assistant message start but got user message start instead".to_string(),
-            ));
+    // The payload is the bare event body and the `:event-type` header names the event. The TS SDK
+    // unmarshals each frame into `{ [eventType]: body }` before the provider reads it.
+    match message.event_type.as_deref() {
+        Some("messageStart") => {
+            let role = parsed.get("role").and_then(Value::as_str).unwrap_or("");
+            if role != "assistant" {
+                return Err(ProviderError::Message(
+                    "Unexpected assistant message start but got user message start instead"
+                        .to_string(),
+                ));
+            }
+            writer.push(AssistantMessageEvent::Start {
+                partial: output.clone(),
+            });
         }
-        writer.push(AssistantMessageEvent::Start {
-            partial: output.clone(),
-        });
-        return Ok(());
-    }
-
-    if let Some(content_block_start) = parsed.get("contentBlockStart") {
-        handle_content_block_start(content_block_start, output, writer, state);
-        return Ok(());
-    }
-
-    if let Some(content_block_delta) = parsed.get("contentBlockDelta") {
-        handle_content_block_delta(content_block_delta, model, output, writer, state);
-        return Ok(());
-    }
-
-    if let Some(content_block_stop) = parsed.get("contentBlockStop") {
-        handle_content_block_stop(content_block_stop, output, writer, state);
-        return Ok(());
-    }
-
-    if let Some(message_stop) = parsed.get("messageStop") {
-        let stop_reason = message_stop.get("stopReason").and_then(Value::as_str);
-        output.stop_reason = map_stop_reason(stop_reason);
-        if output.stop_reason == StopReason::Error {
-            output.stop_reason_raw = stop_reason.map(str::to_string);
+        Some("contentBlockStart") => handle_content_block_start(&parsed, output, writer, state),
+        Some("contentBlockDelta") => {
+            handle_content_block_delta(&parsed, model, output, writer, state);
         }
-        return Ok(());
-    }
-
-    if let Some(metadata) = parsed.get("metadata") {
-        handle_metadata(metadata, model, output, request_id);
-        return Ok(());
+        Some("contentBlockStop") => handle_content_block_stop(&parsed, output, writer, state),
+        Some("messageStop") => {
+            let stop_reason = parsed.get("stopReason").and_then(Value::as_str);
+            output.stop_reason = map_stop_reason(stop_reason);
+            if output.stop_reason == StopReason::Error {
+                output.stop_reason_raw = stop_reason.map(str::to_string);
+            }
+        }
+        Some("metadata") => handle_metadata(&parsed, model, output, request_id),
+        // The TS SDK drops an event type its model does not define. A frame with no `:event-type`
+        // header throws in the TS SDK instead, but Bedrock sets that header on every event frame.
+        Some(_) | None => {}
     }
 
     Ok(())
@@ -419,14 +407,13 @@ fn handle_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_stream::AssistantMessageEventStream;
+    use crate::providers::bedrock::eventstream::EventStreamDecoder;
     use crate::types::{zero_model_cost, ModelInput, Usage};
     use serde_json::json;
 
-    /// TS `handleMetadata` assigns `usage.totalTokens = event.usage.totalTokens || input + output`:
-    /// an explicitly reported zero total is falsy and falls back to the input/output sum.
-    #[test]
-    fn metadata_usage_total_tokens_explicit_zero_falls_back_to_sum() {
-        let model = Model {
+    fn bedrock_model() -> Model {
+        Model {
             id: "anthropic.claude-fable-5".into(),
             name: "Claude Fable 5".into(),
             api: crate::providers::bedrock::API_BEDROCK_CONVERSE_STREAM.to_string(),
@@ -442,7 +429,68 @@ mod tests {
             featured: None,
             headers: None,
             compat: None,
-        };
+        }
+    }
+
+    /// A real `converse-stream` response (global.anthropic.claude-sonnet-4-6, bearer auth): every
+    /// frame carries the bare event body and names the event only in its `:event-type` header.
+    #[test]
+    fn a_captured_converse_stream_yields_its_text_tool_call_and_usage() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/testdata/bedrock_converse_stream_tool_use.bin"
+        ))
+        .unwrap();
+        let model = bedrock_model();
+        let (writer, _stream) = AssistantMessageEventStream::new();
+        let mut state = BedrockStreamState::new();
+        let initial = crate::event_stream::initial_assistant_message(
+            crate::providers::bedrock::API_BEDROCK_CONVERSE_STREAM,
+            "bedrock",
+            &model.id,
+        );
+        let mut output = initial.clone();
+
+        for message in EventStreamDecoder::new().push(&bytes) {
+            handle_event(&message, &model, &mut output, &writer, &mut state, None).unwrap();
+        }
+
+        let mut arguments = Map::new();
+        arguments.insert("city".into(), json!("Paris"));
+        assert_eq!(
+            output,
+            AssistantMessage {
+                content: vec![
+                    AssistantContent::Text(TextContent {
+                        text: "I'll check the weather in Paris for you right now!".into(),
+                        text_signature: None,
+                        rest: Map::default(),
+                    }),
+                    AssistantContent::ToolCall(ToolCall {
+                        id: "tooluse_GwM4UPYlgodVPeftZotPyj".into(),
+                        name: "get_weather".into(),
+                        arguments,
+                        thought_signature: None,
+                        rest: Map::default(),
+                    }),
+                ],
+                usage: Usage {
+                    input: 578,
+                    output: 66,
+                    total_tokens: 644,
+                    ..Usage::default()
+                },
+                stop_reason: StopReason::ToolUse,
+                ..initial
+            }
+        );
+    }
+
+    /// TS `handleMetadata` assigns `usage.totalTokens = event.usage.totalTokens || input + output`:
+    /// an explicitly reported zero total is falsy and falls back to the input/output sum.
+    #[test]
+    fn metadata_usage_total_tokens_explicit_zero_falls_back_to_sum() {
+        let model = bedrock_model();
         let request_id = None;
         let mut output = crate::event_stream::initial_assistant_message(
             crate::providers::bedrock::API_BEDROCK_CONVERSE_STREAM,
