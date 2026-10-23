@@ -528,9 +528,9 @@ async fn run_stream(
             headers.push((name.clone(), value.clone()));
         }
     } else {
-        let credentials = resolve_credentials(options.profile.as_deref()).ok_or_else(|| {
-            ProviderError::Message("No AWS credentials available for Bedrock".to_string())
-        })?;
+        let credentials = resolve_credentials(options.profile.as_deref())
+            .await
+            .map_err(ProviderError::Message)?;
         let (amz_date, authorization, security_token) = sigv4_headers(
             &crate::providers::bedrock::auth::SigV4Params {
                 method: "POST",
