@@ -486,12 +486,12 @@ async fn run_stream(
     }
 
     let (endpoint, region) = resolve_endpoint(model, &options);
-    let path_and_query = format!("/model/{}/converse-stream", encode_model_id(&model.id));
+    let request_path = format!("/model/{}/converse-stream", encode_model_id(&model.id));
     let host = url::Url::parse(&endpoint)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .ok_or_else(|| ProviderError::Message(format!("Invalid Bedrock endpoint: {endpoint}")))?;
-    let url = format!("{endpoint}{path_and_query}");
+    let url = format!("{endpoint}{request_path}");
 
     let mut headers: Vec<(String, String)> = vec![
         ("content-type".into(), "application/json".into()),
@@ -534,12 +534,13 @@ async fn run_stream(
         let (amz_date, authorization, security_token) = sigv4_headers(
             &crate::providers::bedrock::auth::SigV4Params {
                 method: "POST",
-                path_and_query: &path_and_query,
+                path: &request_path,
                 host: &host,
                 region: &region,
                 service: "bedrock",
                 body: payload.to_string().as_bytes(),
                 extra_signed_headers: &extra_signed_headers,
+                timestamp: std::time::SystemTime::now(),
             },
             &credentials,
         );

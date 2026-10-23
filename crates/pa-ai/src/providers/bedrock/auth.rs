@@ -101,19 +101,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// UTC timestamp in `SigV4` formats: `x-amz-date` (20250101T000000Z) and date stamp (20250101).
-/// Uses std time to avoid a chrono dependency.
-fn now_utc_parts() -> (String, String) {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    let (year, month, day, hour, minute, second) = civil_from_unix(seconds);
-    (
-        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
-        format!("{year:04}{month:02}{day:02}"),
-    )
-}
-
 /// Convert a Unix timestamp to civil UTC date-time (Howard Hinnant's algorithm).
 fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     // u64::MAX / 86_400 is ~2.1e14; the day count always fits i64.
@@ -140,18 +127,20 @@ fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
-/// Produce the `SigV4` auth headers for a request. Returns `(x-amz-date, authorization,
-/// x-amz-security-token)`.
+/// Inputs of one `SigV4` signature.
 pub struct SigV4Params<'a> {
     pub method: &'a str,
-    /// Path with query string, starting with `/`.
-    pub path_and_query: &'a str,
+    /// Request path, already percent-encoded once, with no query string. The canonical query line
+    /// is therefore always empty.
+    pub path: &'a str,
     pub host: &'a str,
     pub region: &'a str,
     pub service: &'a str,
     pub body: &'a [u8],
     /// Extra headers included in the signed header list (lowercase names).
     pub extra_signed_headers: &'a [(String, String)],
+    /// The signing time.
+    pub timestamp: std::time::SystemTime,
 }
 
 /// Produce the `SigV4` auth headers for a request. Returns `(x-amz-date, authorization,
@@ -160,7 +149,15 @@ pub fn sigv4_headers(
     params: &SigV4Params<'_>,
     credentials: &AwsCredentials,
 ) -> (String, String, Option<String>) {
-    let (amz_date, date_stamp) = now_utc_parts();
+    // `SigV4` timestamp formats: `x-amz-date` (20250101T000000Z) and date stamp (20250101). Uses std
+    // time to avoid a chrono dependency.
+    let seconds = params
+        .timestamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let (year, month, day, hour, minute, second) = civil_from_unix(seconds);
+    let amz_date = format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z");
+    let date_stamp = format!("{year:04}{month:02}{day:02}");
     let payload_hash = sha256_hex(params.body);
 
     let mut canonical_headers: Vec<(String, String)> = vec![
@@ -189,9 +186,22 @@ pub fn sigv4_headers(
                 text
             });
 
+    // Every service except S3 double-encodes the path in the canonical URI, which is what the AWS
+    // SDK signer does: the escaped model id `v1%3A0` is signed as `v1%253A0`. Only the signed copy
+    // changes, the request URL keeps the single encoding.
+    let mut canonical_uri = String::new();
+    for byte in params.path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            canonical_uri.push(char::from(byte));
+        } else {
+            let _ = write!(canonical_uri, "%{byte:02X}");
+        }
+    }
+
+    // The empty line after the URI is the canonical query string, which is always empty here.
+    let method = params.method;
     let canonical_request = format!(
-        "{}\n{}\n{canonical_headers_text}\n{signed_headers}\n{payload_hash}",
-        params.method, params.path_and_query
+        "{method}\n{canonical_uri}\n\n{canonical_headers_text}\n{signed_headers}\n{payload_hash}"
     );
 
     let credential_scope = format!(
@@ -330,4 +340,86 @@ fn env_region_or_profile() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{sigv4_headers, AwsCredentials, SigV4Params};
+
+    // The expected values come from botocore 1.42.97 `SigV4Auth(creds, "bedrock",
+    // "us-east-1").add_auth(...)` with the documented AWS example keys, signing the same request at
+    // the same time (2026-10-23T08:45:17Z).
+
+    #[test]
+    fn sigv4_headers_match_botocore_for_a_session_token_request() {
+        let credentials = AwsCredentials {
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: Some("session-token-example".to_string()),
+        };
+        let signed = sigv4_headers(
+            &SigV4Params {
+                method: "POST",
+                path: "/model/global.anthropic.claude-haiku-5-5/converse-stream",
+                host: "bedrock-runtime.us-east-1.amazonaws.com",
+                region: "us-east-1",
+                service: "bedrock",
+                body: br#"{"messages":[]}"#,
+                extra_signed_headers: &[],
+                timestamp: UNIX_EPOCH + Duration::from_secs(1_792_745_117),
+            },
+            &credentials,
+        );
+
+        assert_eq!(
+            signed,
+            (
+                "20261023T084517Z".to_string(),
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261023/us-east-1/bedrock/aws4_request, \
+                 SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, \
+                 Signature=33bddde0f56441c5ccf0701c613870b3f41fc5ca973c7902ea97a3c0844642a7"
+                    .to_string(),
+                Some("session-token-example".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn sigv4_headers_double_encode_an_escaped_model_id_like_botocore() {
+        let credentials = AwsCredentials {
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+        };
+        let signed = sigv4_headers(
+            &SigV4Params {
+                method: "POST",
+                path: "/model/anthropic.claude-opus-4-5-20251101-v1%3A0/converse-stream",
+                host: "bedrock-runtime.us-east-1.amazonaws.com",
+                region: "us-east-1",
+                service: "bedrock",
+                body: br#"{"messages":[]}"#,
+                extra_signed_headers: &[(
+                    "x-amzn-bedrock-request-metadata".to_string(),
+                    r#"{"team":"a"}"#.to_string(),
+                )],
+                timestamp: UNIX_EPOCH + Duration::from_secs(1_792_745_117),
+            },
+            &credentials,
+        );
+
+        assert_eq!(
+            signed,
+            (
+                "20261023T084517Z".to_string(),
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261023/us-east-1/bedrock/aws4_request, \
+                 SignedHeaders=content-type;host;x-amz-date;x-amzn-bedrock-request-metadata, \
+                 Signature=62eec0df0a8ee67f9742219cb19bd8662413fc550b227f6a4dc8187ddcc06225"
+                    .to_string(),
+                None,
+            )
+        );
+    }
 }
